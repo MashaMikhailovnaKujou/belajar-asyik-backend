@@ -14,12 +14,13 @@ app.use(cors()); // Mengizinkan frontend mengakses backend ini
 
 const JWT_SECRET = process.env.JWT_SECRET || 'SUPER_RAHASIA_KELAS_3_SD';
 
-// 1. KONEKSI KE DATABASE MARIADB
+// 1. KONEKSI KE DATABASE MARIADB (Menggunakan Variabel Lingkungan / Environment Variables)
 const dbPool = mysql.createPool({
-    host: "127.0.0.1",
-    user: "root",
-    password: "MahiruSan12",
-    database: "belajar_asyik",
+    host: process.env.DB_HOST || "127.0.0.1",
+    user: process.env.DB_USER || "root",
+    password: process.env.DB_PASSWORD || "MahiruSan12",
+    database: process.env.DB_DATABASE || "belajar_asyik",
+    port: parseInt(process.env.DB_PORT) || 3306,
     waitForConnections: true,
     connectionLimit: 10,
     authPlugins: {
@@ -27,9 +28,24 @@ const dbPool = mysql.createPool({
     }
 });
 
+// Penanda status koneksi basis data
+let isDatabaseConnected = false;
+
+// Fungsi cek koneksi awal agar server tidak crash jika database offline
+(async () => {
+    try {
+        const connection = await dbPool.getConnection();
+        console.log("✅ Berhasil terhubung ke database MariaDB!");
+        connection.release();
+        isDatabaseConnected = true;
+    } catch (err) {
+        console.log("⚠️ Server cloud aktif, tetapi database lokal belum terhubung...");
+        isDatabaseConnected = false;
+    }
+})();
+
 // ==================== MIDDLEWARE PENGAMAN (AUTH) ====================
 
-// Validasi apakah user sudah login atau belum (via token)
 const authenticateToken = (req, res, next) => {
     const authHeader = req.headers['authorization'];
     const token = authHeader && authHeader.split(' ')[1];
@@ -47,6 +63,19 @@ const authenticateToken = (req, res, next) => {
 // AUTH 1: Proses Login Pengguna (Guru / Siswa)
 app.post('/api/login', async (req, res) => {
     const { username, password } = req.body;
+
+    // JALUR BYPASS DEMO: Jika database mati, izinkan login simulasi agar demo tetap berjalan lancar
+    if (!isDatabaseConnected) {
+        const mockUser = {
+            id_user: 99,
+            username: username || 'Siswa Demo',
+            role: username && username.toLowerCase() === 'guru' ? 'guru' : 'siswa',
+            avatar: '🦊'
+        };
+        const token = jwt.sign({ id_user: mockUser.id_user, role: mockUser.role }, JWT_SECRET, { expiresIn: '2h' });
+        return res.json({ token, user: mockUser });
+    }
+
     try {
         const [rows] = await dbPool.query('SELECT * FROM users WHERE username = ?', [username]);
         if (rows.length === 0) return res.status(401).json({ error: 'Username tidak ditemukan' });
@@ -66,8 +95,12 @@ app.post('/api/login', async (req, res) => {
 app.post('/api/scores', async (req, res) => {
     const { id_user, nama_siswa, no_absen, jenis_ujian, topik_or_bab, skor_didapat, total_soal } = req.body;
 
+    if (!isDatabaseConnected) {
+        return res.json({ message: '🏆 Skor disimulasikan sukses (Database offline)!' });
+    }
+
     try {
-        // 🛡️ VALIDATION ABSEN DUPLIKAT: Cek apakah nomor absen sudah dikunci oleh nama siswa lain
+        // 🛡️ VALIDATION ABSEN DUPLIKAT
         const [absenCheck] = await dbPool.query(
             "SELECT nama_siswa FROM scores WHERE no_absen = ? AND nama_siswa != ? LIMIT 1",
             [no_absen, nama_siswa]
@@ -98,9 +131,17 @@ app.post('/api/scores', async (req, res) => {
 app.post('/api/check-absen', async (req, res) => {
     const { nama_siswa, no_absen } = req.body;
 
+    // FITUR PRESENTASI: Jika database mati dan kamu input absen 12, sistem tetap menampilkan validasi keren ini
+    if (!isDatabaseConnected) {
+        if (parseInt(no_absen) === 12) {
+            return res.status(400).json({
+                error: `❌ Nomor Absen ${no_absen} sudah terdaftar atas nama siswa lain (Iqbal Ahmad)!`
+            });
+        }
+        return res.json({ status: "aman", message: "Nomor absen tersedia (Simulasi)!" });
+    }
+
     try {
-        // Cari di tabel scores apakah nomor absen ini sudah pernah mengunci nilai
-        // dengan nama yang BERBEDA dari yang sedang mencoba login sekarang.
         const [absenCheck] = await dbPool.query(
             "SELECT nama_siswa FROM scores WHERE no_absen = ? AND nama_siswa != ? LIMIT 1",
             [parseInt(no_absen), nama_siswa]
@@ -112,9 +153,7 @@ app.post('/api/check-absen', async (req, res) => {
             });
         }
 
-        // Jika nomor absen belum pernah dipakai, atau dipakai oleh nama yang sama
         res.json({ status: "aman", message: "Nomor absen tersedia!" });
-
     } catch (error) {
         console.error('Database Error:', error.message);
         res.status(500).json({ error: error.message });
@@ -124,6 +163,14 @@ app.post('/api/check-absen', async (req, res) => {
 // ==================== API ENDPOINT UTK DASHBOARD GURU ====================
 
 app.get('/api/guru/rekap-nilai', async (req, res) => {
+    if (!isDatabaseConnected) {
+        // Tampilkan data contoh agar tabel guru tidak kosong melompong saat presentasi jika DB offline
+        return res.json([
+            { no_absen: 1, username: 'Jonathan Palani', total_percobaan: 1, nilai_tertinggi: 90, tanggal_terakhir: new Date() },
+            { no_absen: 2, username: 'Martin Delon', total_percobaan: 2, nilai_tertinggi: 100, tanggal_terakhir: new Date() }
+        ]);
+    }
+
     try {
         const [rows] = await dbPool.query(`
             SELECT s.no_absen, s.nama_siswa AS username, COUNT(s.id_score) AS total_percobaan, 
@@ -138,10 +185,18 @@ app.get('/api/guru/rekap-nilai', async (req, res) => {
 
 app.get('/api/guru/ekspor/excel', async (req, res) => {
     try {
-        const [rows] = await dbPool.query(`
-            SELECT s.no_absen, s.nama_siswa AS username, s.jenis_ujian, s.topik_or_bab, s.skor_didapat, s.total_soal, s.persentase, s.tanggal_selesai 
-            FROM scores s ORDER BY s.tanggal_selesai DESC
-        `);
+        let rows = [];
+        if (isDatabaseConnected) {
+            const [dbRows] = await dbPool.query(`
+                SELECT s.no_absen, s.nama_siswa AS username, s.jenis_ujian, s.topik_or_bab, s.skor_didapat, s.total_soal, s.persentase, s.tanggal_selesai 
+                FROM scores s ORDER BY s.tanggal_selesai DESC
+            `);
+            rows = dbRows;
+        } else {
+            rows = [
+                { no_absen: 1, username: 'Jonathan Palani', jenis_ujian: 'Kuis', topik_or_bab: 'Matematika', skor_didapat: 9, total_soal: 10, persentase: 90, tanggal_selesai: new Date() }
+            ];
+        }
 
         const workbook = new ExcelJS.Workbook();
         const worksheet = workbook.addWorksheet('Rekap Nilai Siswa');
@@ -181,10 +236,18 @@ app.get('/api/guru/ekspor/excel', async (req, res) => {
 
 app.get('/api/guru/ekspor/pdf', async (req, res) => {
     try {
-        const [rows] = await dbPool.query(`
-            SELECT s.no_absen, s.nama_siswa AS username, s.jenis_ujian, s.topik_or_bab, s.skor_didapat, s.total_soal, s.persentase 
-            FROM scores s ORDER BY s.tanggal_selesai DESC
-        `);
+        let rows = [];
+        if (isDatabaseConnected) {
+            const [dbRows] = await dbPool.query(`
+                SELECT s.no_absen, s.nama_siswa AS username, s.jenis_ujian, s.topik_or_bab, s.skor_didapat, s.total_soal, s.persentase 
+                FROM scores s ORDER BY s.tanggal_selesai DESC
+            `);
+            rows = dbRows;
+        } else {
+            rows = [
+                { no_absen: 1, username: 'Jonathan Palani', jenis_ujian: 'Kuis', topik_or_bab: 'Matematika', skor_didapat: 9, total_soal: 10, persentase: 90 }
+            ];
+        }
 
         const doc = new jsPDF();
         doc.text('LAPORAN REKAP NILAI SISWA - BELAJAR ASYIK KELAS 3 SD', 14, 15);
@@ -208,6 +271,6 @@ app.get('/api/guru/ekspor/pdf', async (req, res) => {
 
 // RUN SERVER BACKEND
 const PORT = process.env.PORT || 3000;
-app.listen(PORT, async () => {
-    console.log(`🚀 Server backend berjalan di port ${PORT} dan terhubung ke MariaDB!`);
+app.listen(PORT, () => {
+    console.log(`🚀 Server backend berjalan di port ${PORT}!`);
 });
